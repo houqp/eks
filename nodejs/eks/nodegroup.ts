@@ -158,6 +158,8 @@ export interface NodeGroupBaseOptions {
      * The tags to apply to the CloudFormation Stack of the Worker NodeGroup.
      */
     cloudFormationTags?: { [key: string]: string };
+
+    enableClusterAutoscaling?: boolean;
 }
 
 /**
@@ -459,6 +461,18 @@ ${customUserData}
     // Merge any user supplied tags for the ASG's.
     if (args.autoScalingGroupTags) {
         autoScalingGroupTags = pulumi.concat(autoScalingGroupTags, tagsToAsgTags(args.autoScalingGroupTags));
+    }
+
+    if (args.enableClusterAutoscaling) {
+        const clusterAutoscalingTags: {[key: string]: string} = {};
+        clusterAutoscalingTags["k8s.io/cluster-autoscaler/enabled"] = "true";
+        clusterAutoscalingTags[`k8s.io/cluster-autoscaler/${eksCluster.name}`] = "owned";
+        if (args.labels) {
+            for (const key of Object.keys(args.labels)) {
+                clusterAutoscalingTags[`k8s.io/cluster-autoscaler/node-template/label/${key}`] = args.labels[key];
+            }
+        }
+        autoScalingGroupTags = pulumi.concat(autoScalingGroupTags, tagsToAsgTags(clusterAutoscalingTags));
     }
 
     const cfnTemplateBody = pulumi.all([

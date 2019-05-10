@@ -15,9 +15,13 @@
 import * as aws from "@pulumi/aws";
 import * as k8s from "@pulumi/kubernetes";
 import * as pulumi from "@pulumi/pulumi";
+import * as crypto from "crypto";
+import * as fs from "fs";
 import * as jsyaml from "js-yaml";
+import * as path from "path";
 import which = require("which");
 
+import { createClusterAutoscaler } from "./autoscaler";
 import { VpcCni, VpcCniOptions } from "./cni";
 import { createDashboard } from "./dashboard";
 import { createNodeGroup, NodeGroup, NodeGroupBaseOptions, NodeGroupData } from "./nodegroup";
@@ -79,6 +83,7 @@ export interface CoreData {
     kubeconfig?: pulumi.Output<any>;
     vpcCni?: VpcCni;
     tags?: { [key: string]: string };
+    instanceRoles: pulumi.Output<aws.iam.Role[]>;
 }
 
 export function createCore(name: string, args: ClusterOptions, parent: pulumi.ComponentResource): CoreData {
@@ -197,53 +202,51 @@ export function createCore(name: string, args: ClusterOptions, parent: pulumi.Co
     // Create the VPC CNI management resource.
     const vpcCni = new VpcCni(`${name}-vpc-cni`, kubeconfig, args.vpcCniOptions, { parent: parent });
 
+    let instanceRolesInput = args.instanceRoles;
     let instanceRoleMappings: pulumi.Output<RoleMapping[]>;
     let instanceProfile: aws.iam.InstanceProfile | undefined;
     // Create role mappings of the instance roles specified for aws-auth.
-    if (args.instanceRoles) {
-        instanceRoleMappings = pulumi.output(args.instanceRoles).apply(instanceRoles =>
-            instanceRoles.map(role => createInstanceRoleMapping(role.arn)),
-        );
-    } else if (args.instanceRole) {
-        // Create an instance profile if using a default node group
-        if (!args.skipDefaultNodeGroup) {
-            instanceProfile = new aws.iam.InstanceProfile(`${name}-instanceProfile`, {
-                role: args.instanceRole,
-            }, { parent: parent });
+    if (!instanceRolesInput) {
+        if (args.instanceRole) {
+            // Create an instance profile if using a default node group
+            if (!args.skipDefaultNodeGroup) {
+                instanceProfile = new aws.iam.InstanceProfile(`${name}-instanceProfile`, {
+                    role: args.instanceRole,
+                }, { parent: parent });
+            }
+            instanceRolesInput = [args.instanceRole];
+        } else {
+            const instanceRole = (new ServiceRole(`${name}-instanceRole`, {
+                service: "ec2.amazonaws.com",
+                managedPolicyArns: [
+                    "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
+                    "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
+                    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
+                ],
+            }, { parent: parent })).role;
+
+            // Create a new policy for the role, if specified.
+            if (args.customInstanceRolePolicy) {
+                const customRolePolicy = new aws.iam.RolePolicy(`${name}-EKSWorkerCustomPolicy`, {
+                    role: instanceRole,
+                    policy: args.customInstanceRolePolicy,
+                });
+            }
+
+            // Create an instance profile if using a default node group
+            if (!args.skipDefaultNodeGroup) {
+                instanceProfile = new aws.iam.InstanceProfile(`${name}-instanceProfile`, {
+                    role: instanceRole,
+                }, { parent: parent });
+            }
+            instanceRolesInput = [instanceRole];
         }
-
-        instanceRoleMappings = pulumi.output(args.instanceRole).apply(instanceRole =>
-            [createInstanceRoleMapping(instanceRole.arn)],
-        );
-    } else {
-        const instanceRole = (new ServiceRole(`${name}-instanceRole`, {
-            service: "ec2.amazonaws.com",
-            managedPolicyArns: [
-                "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
-                "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
-                "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
-            ],
-        }, { parent: parent })).role;
-
-        // Create a new policy for the role, if specified.
-        if (args.customInstanceRolePolicy) {
-            const customRolePolicy = new aws.iam.RolePolicy(`${name}-EKSWorkerCustomPolicy`, {
-                role: instanceRole,
-                policy: args.customInstanceRolePolicy,
-            });
-        }
-
-        // Create an instance profile if using a default node group
-        if (!args.skipDefaultNodeGroup) {
-            instanceProfile = new aws.iam.InstanceProfile(`${name}-instanceProfile`, {
-                role: instanceRole,
-            }, { parent: parent });
-        }
-
-        instanceRoleMappings = pulumi.output(instanceRole).apply(role =>
-            [createInstanceRoleMapping(role.arn)],
-        );
     }
+
+    const instanceRoles = pulumi.output(instanceRolesInput);
+    instanceRoleMappings = instanceRoles.apply(roles =>
+        roles.map(role => createInstanceRoleMapping(role.arn)),
+    );
 
     const roleMappings = pulumi.all([pulumi.output(args.roleMappings || []), instanceRoleMappings])
         .apply(([mappings, instanceMappings]) => {
@@ -285,6 +288,7 @@ export function createCore(name: string, args: ClusterOptions, parent: pulumi.Co
         instanceProfile: instanceProfile,
         eksNodeAccess: eksNodeAccess,
         tags: args.tags,
+        instanceRoles: instanceRoles,
     };
 }
 
@@ -461,6 +465,11 @@ export interface ClusterOptions {
     deployDashboard?: boolean;
 
     /**
+     * Whether or not to deploy the Kubernetes cluster autoscaler to the cluster.
+     */
+    deployClusterAutoscaler?: boolean;
+
+    /**
      * Key-value mapping of tags that are automatically applied to all AWS
      * resources directly under management with this cluster, which support tagging.
     */
@@ -615,6 +624,13 @@ export class Cluster extends pulumi.ComponentResource {
         // If we need to deploy the Kubernetes dashboard, do so now.
         if (args.deployDashboard === undefined || args.deployDashboard) {
             createDashboard(name, {}, this, this.provider);
+        }
+
+        if (args.deployClusterAutoscaler) {
+            createClusterAutoscaler(name, {
+                instanceRoles: core.instanceRoles,
+                clusterName: core.cluster.name,
+            }, this, this.provider);
         }
 
         this.registerOutputs({ kubeconfig: this.kubeconfig });
